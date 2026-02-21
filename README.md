@@ -162,6 +162,9 @@ The `platformio.ini` automatically installs:
 
 ### 3. Build & Upload
 
+![Setup](images/setup.jpg)
+
+
 Build the project:
 ```bash
 platformio run --environment esp32doit-devkit-v1
