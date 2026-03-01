@@ -33,23 +33,36 @@ WiFiClient wifiClient;
 // Relay pin (change if you use a different GPIO). Avoid using LED pin.
 #define RELAY_PIN 5
 
+// compile-time defaults used if no schedule is stored or MQTT config
+#define DEFAULT_INTERVAL 3600 // one hour between activations
+#define DEFAULT_DURATION 30   // relay on for 30 seconds
+// default explicit turn-on epoch (user asked for 1772431200)
+#define DEFAULT_TURN_ON_AT 1772431200UL
+
 // configuration struct for scheduled on/off
 typedef struct
 {
   unsigned long interval;     // seconds until next ON
   unsigned long duration;     // seconds to stay ON
-  unsigned long next_on_time; // epoch seconds for next ON
+  unsigned long next_on_time; // epoch seconds for next ON (or relative seconds if time not available)
   unsigned long off_time;     // epoch seconds when to turn OFF
   bool is_on;
 } system_config_t;
 
-system_config_t config = {0, 0, 0, 0, false};
+// a default instance that will be used on first boot or when prefs are empty
+static const system_config_t DEFAULT_CONFIG = {DEFAULT_INTERVAL, DEFAULT_DURATION, DEFAULT_TURN_ON_AT, 0, false};
+
+// current active configuration (starts with defaults)
+system_config_t config = DEFAULT_CONFIG;
 
 // NVS (Preferences) for persisting schedule
 Preferences prefs;
 
 static void saveSchedule()
 {
+  // store interval and duration as well so the schedule survives reboots
+  prefs.putULong("interval", config.interval);
+  prefs.putULong("duration", config.duration);
   // store next_on_time, off_time, and is_on
   prefs.putULong("next_on", config.next_on_time);
   prefs.putULong("off_time", config.off_time);
@@ -58,7 +71,11 @@ static void saveSchedule()
 
 static void loadSchedule()
 {
-  config.next_on_time = prefs.getULong("next_on", 0);
+  // load interval/duration and fall back to defaults if not present
+  config.interval = prefs.getULong("interval", DEFAULT_INTERVAL);
+  config.duration = prefs.getULong("duration", DEFAULT_DURATION);
+  // use DEFAULT_TURN_ON_AT if there is no stored value
+  config.next_on_time = prefs.getULong("next_on", DEFAULT_TURN_ON_AT);
   config.off_time = prefs.getULong("off_time", 0);
   config.is_on = prefs.getULong("is_on", 0) ? true : false;
 }
@@ -116,25 +133,45 @@ static unsigned long parseNumber(const char *src, const char *key)
   return strtoul(p, NULL, 10);
 }
 
+// return current time in seconds; if NTP/RTC not set yet then use uptime
+static unsigned long getCurrentTime()
+{
+  time_t t = time(nullptr);
+  if (t >= 100000)
+  {
+    return (unsigned long)t;
+  }
+  // no valid epoch, fall back to relative seconds since boot
+  return millis() / 1000;
+}
+
 // forward declaration of blink task
 void blinkTask(void *param);
 
-void connectToMqtt()
+// attempt a single MQTT connection; returns true on success
+bool connectToMqtt()
 {
+  if (client.connected())
+    return true;
+
   Serial.println("Connecting to MQTT...");
   // indicate MQTT connection attempt
   blinkState = STATE_MQTT_CONNECTING;
-  while (!client.connect("home_irrigator"))
-  {
-    Serial.print(".");
-    delay(1000);
-  }
-  Serial.println("\nconnected!");
-  // indicate MQTT connected
-  blinkState = STATE_MQTT_CONNECTED;
 
-  client.subscribe("/home_irrigator/config");
-  client.subscribe("/home_irrigator/control");
+  if (client.connect("cardoz"))
+  {
+    Serial.println("connected!");
+    blinkState = STATE_MQTT_CONNECTED;
+    client.subscribe("/cardoz/config");
+    client.subscribe("/cardoz/control");
+    return true;
+  }
+  else
+  {
+    Serial.println("MQTT connect failed");
+    blinkState = STATE_MQTT_FAILED;
+    return false;
+  }
 }
 
 void messageReceived(String &topic, String &payload)
@@ -144,7 +181,7 @@ void messageReceived(String &topic, String &payload)
   const char *cstr = payload.c_str();
 
   // handle config messages
-  if (topic.equals("/home_irrigator/config"))
+  if (topic.equals("/cardoz/config"))
   {
     // parse simple JSON-like payload for interval and duration (seconds)
     // example payload: {"interval":3600,"duration":30}
@@ -196,7 +233,7 @@ void messageReceived(String &topic, String &payload)
   }
 
   // handle direct control messages
-  if (topic.equals("/home_irrigator/control"))
+  if (topic.equals("/cardoz/control"))
   {
     // payload can be just ON/OFF or JSON like {"output":"ON"}
     char valbuf[16] = {0};
@@ -237,7 +274,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT ON");
       if (client.connected())
       {
-        client.publish("/home_irrigator/ack", "ON");
+        client.publish("/cardoz/ack", "ON");
       }
       // persist immediate control change
       saveSchedule();
@@ -250,7 +287,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT OFF");
       if (client.connected())
       {
-        client.publish("/home_irrigator/ack", "OFF");
+        client.publish("/cardoz/ack", "OFF");
       }
       // persist immediate control change
       saveSchedule();
@@ -287,7 +324,55 @@ void setup()
   // start the blink thread before attempting WiFi connection
   xTaskCreate(blinkTask, "blink", 1024, nullptr, 1, nullptr);
 
-  // WiFiManager, Local intialization. Once its business is done, there is no need to keep it around
+  // --- configuration loading happens before WiFi so schedule can run when offline ---
+  prefs.begin("home_irrigator", false);
+  loadSchedule();
+  // if prefs were empty we now have DEFAULT_CONFIG values, including default turn-on
+  Serial.print("Initial schedule interval ");
+  Serial.print(config.interval);
+  Serial.print("s, duration ");
+  Serial.print(config.duration);
+  Serial.print("s, next_on_time ");
+  Serial.println(config.next_on_time);
+  // perform initial adjustments with whatever time source we have now
+  unsigned long startupNow = getCurrentTime();
+  // if we are using the special default epoch value, convert it to a usable time
+  if (config.next_on_time == DEFAULT_TURN_ON_AT)
+  {
+    if (startupNow < 100000) // still using uptime (no NTP yet)
+    {
+      config.next_on_time = startupNow + config.interval;
+      Serial.println("Offline startup: applied relative schedule from default");
+    }
+    else if (startupNow > DEFAULT_TURN_ON_AT)
+    {
+      // once clock is synced and we've already passed the epoch
+      config.next_on_time = startupNow + config.interval;
+      Serial.println("Default epoch passed; rescheduled relative to now");
+    }
+    // otherwise leave the default epoch in place and schedule will fire when time catches up
+  }
+  // store back any fixes
+  adjustScheduleForMissedOn(startupNow);
+  // enforce relay state if necessary
+  if (config.is_on && config.off_time > 0)
+  {
+    if (startupNow < config.off_time)
+    {
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.print("Restored relay ON until epoch: ");
+      Serial.println(config.off_time);
+    }
+    else
+    {
+      digitalWrite(RELAY_PIN, LOW);
+      config.is_on = false;
+      config.off_time = 0;
+      saveSchedule();
+    }
+  }
+
+  // WiFiManager, Local initialization. Once its business is done, there is no need to keep it around
   WiFiManager wm;
 
   // reset settings - wipe stored credentials for testing
@@ -339,23 +424,18 @@ void setup()
       Serial.print("Current epoch: ");
       Serial.println((unsigned long)now);
     }
-    // open prefs and load any saved schedule
-    prefs.begin("home_irrigator", false);
-    loadSchedule();
-    // adjust schedule if we missed an ON while offline
-    adjustScheduleForMissedOn((unsigned long)now);
-    // if schedule indicates the relay should currently be ON, enforce it
+    // after syncing time it's worth re-checking schedule in case the clock jumped
+    unsigned long syncedNow = (unsigned long)now;
+    Serial.println("Re‑adjusting schedule after NTP sync");
+    adjustScheduleForMissedOn(syncedNow);
     if (config.is_on && config.off_time > 0)
     {
-      if (now < config.off_time)
+      if (syncedNow < config.off_time)
       {
-        digitalWrite(RELAY_PIN, HIGH);
-        Serial.print("Restored relay ON until epoch: ");
-        Serial.println(config.off_time);
+        // leave relay as is
       }
       else
       {
-        // saved off_time already passed
         digitalWrite(RELAY_PIN, LOW);
         config.is_on = false;
         config.off_time = 0;
@@ -367,7 +447,11 @@ void setup()
   client.begin("broker.emqx.io", 1883, wifiClient);
   client.onMessage(messageReceived);
 
-  connectToMqtt();
+  // ensure MQTT is connected before leaving setup (blocks)
+  while (!connectToMqtt())
+  {
+    delay(1000);
+  }
 }
 
 void loop()
@@ -376,7 +460,13 @@ void loop()
 
   if (!client.connected())
   {
-    connectToMqtt();
+    // try reconnecting with a short backoff to avoid busy-looping
+    if (!connectToMqtt())
+    {
+      // failed again, blink state already updated; wait before retrying
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
+      return; // exit this iteration of Arduino loop()
+    }
   }
 
   // Publish a heartbeat message every 30 seconds
@@ -384,15 +474,14 @@ void loop()
   if (nowMillis - lastMillis > 30000)
   {
     lastMillis = nowMillis;
-    client.publish("/home_irrigator/heartbeat", "alive");
+    client.publish("/cardoz/heartbeat", "alive");
   }
 
-  // scheduling: use epoch time to control relay based on config
-  time_t now_t = time(nullptr);
-  unsigned long now = (unsigned long)now_t;
+  // scheduling: use current time (epoch or uptime) to control relay based on config
+  unsigned long now = getCurrentTime();
 
-  // if we have a configuration but next_on_time is not initialized, set it when time available
-  if (config.interval > 0 && config.next_on_time == 0 && now >= 100000)
+  // if we have a configuration but next_on_time is not initialized, set it now
+  if (config.interval > 0 && config.next_on_time == 0)
   {
     config.next_on_time = now + config.interval;
     Serial.print("Initialized scheduling, next ON at: ");
@@ -418,7 +507,7 @@ void loop()
     Serial.println(config.next_on_time);
     if (client.connected())
     {
-      client.publish("/home_irrigator/ack", "ON");
+      client.publish("/cardoz/ack", "ON");
     }
     // persist schedule changes
     saveSchedule();
@@ -434,7 +523,7 @@ void loop()
     Serial.println(now);
     if (client.connected())
     {
-      client.publish("/home_irrigator/ack", "OFF");
+      client.publish("/cardoz/ack", "OFF");
     }
     // persist schedule changes
     saveSchedule();
