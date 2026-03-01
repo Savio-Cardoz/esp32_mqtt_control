@@ -158,12 +158,12 @@ bool connectToMqtt()
   // indicate MQTT connection attempt
   blinkState = STATE_MQTT_CONNECTING;
 
-  if (client.connect("cardoz"))
+  if (client.connect("<topic_header>"))
   {
     Serial.println("connected!");
     blinkState = STATE_MQTT_CONNECTED;
-    client.subscribe("/cardoz/config");
-    client.subscribe("/cardoz/control");
+    client.subscribe("/<topic_header>/config");
+    client.subscribe("/<topic_header>/control");
     return true;
   }
   else
@@ -181,7 +181,7 @@ void messageReceived(String &topic, String &payload)
   const char *cstr = payload.c_str();
 
   // handle config messages
-  if (topic.equals("/cardoz/config"))
+  if (topic.equals("/<topic_header>/config"))
   {
     // parse simple JSON-like payload for interval and duration (seconds)
     // example payload: {"interval":3600,"duration":30}
@@ -233,7 +233,7 @@ void messageReceived(String &topic, String &payload)
   }
 
   // handle direct control messages
-  if (topic.equals("/cardoz/control"))
+  if (topic.equals("/<topic_header>/control"))
   {
     // payload can be just ON/OFF or JSON like {"output":"ON"}
     char valbuf[16] = {0};
@@ -274,7 +274,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT ON");
       if (client.connected())
       {
-        client.publish("/cardoz/ack", "ON");
+        client.publish("/<topic_header>/ack", "ON");
       }
       // persist immediate control change
       saveSchedule();
@@ -287,7 +287,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT OFF");
       if (client.connected())
       {
-        client.publish("/cardoz/ack", "OFF");
+        client.publish("/<topic_header>/ack", "OFF");
       }
       // persist immediate control change
       saveSchedule();
@@ -474,7 +474,7 @@ void loop()
   if (nowMillis - lastMillis > 30000)
   {
     lastMillis = nowMillis;
-    client.publish("/cardoz/heartbeat", "alive");
+    client.publish("/<topic_header>/heartbeat", "alive");
   }
 
   // scheduling: use current time (epoch or uptime) to control relay based on config
@@ -507,7 +507,7 @@ void loop()
     Serial.println(config.next_on_time);
     if (client.connected())
     {
-      client.publish("/cardoz/ack", "ON");
+      client.publish("/<topic_header>/ack", "ON");
     }
     // persist schedule changes
     saveSchedule();
@@ -523,7 +523,7 @@ void loop()
     Serial.println(now);
     if (client.connected())
     {
-      client.publish("/cardoz/ack", "OFF");
+      client.publish("/<topic_header>/ack", "OFF");
     }
     // persist schedule changes
     saveSchedule();
