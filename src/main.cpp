@@ -229,6 +229,12 @@ void messageReceived(String &topic, String &payload)
       saveSchedule();
     }
 
+    /* Publish back to acknowledge reception of config */
+    if (client.connected())
+    {
+      client.publish("/<topic_header>/ack", "{\"interval\":" + String(config.interval) + ",\"duration\":" + String(config.duration) + ",\"Turn_ON_AT\":" + String(config.next_on_time) + "}");
+    }
+
     return;
   }
 
@@ -465,7 +471,6 @@ void loop()
     {
       // failed again, blink state already updated; wait before retrying
       vTaskDelay(5000 / portTICK_PERIOD_MS);
-      return; // exit this iteration of Arduino loop()
     }
   }
 
@@ -498,7 +503,7 @@ void loop()
     config.is_on = true;
     config.off_time = now + config.duration;
     // reset next_on_time to after this duration + interval
-    config.next_on_time = now + config.duration + config.interval;
+    config.next_on_time = now + config.interval;
     Serial.print("Turned ON at epoch: ");
     Serial.println(now);
     Serial.print("Scheduled OFF at epoch: ");
