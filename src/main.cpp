@@ -2,6 +2,8 @@
 #include <MQTT.h>
 #include <time.h>
 #include <Preferences.h>
+#include <cJSON.h>
+#include "mqtt_topics.h"
 
 #define MQTT_HOST "broker.emqx.io"
 #define MQTT_PORT 1883
@@ -38,6 +40,8 @@ WiFiClient wifiClient;
 #define DEFAULT_DURATION 30   // relay on for 30 seconds
 // default explicit turn-on epoch (user asked for 1772431200)
 #define DEFAULT_TURN_ON_AT 1772431200UL
+
+#define SCHEDULE_TOLERANCE_SECONDS 60
 
 // configuration struct for scheduled on/off
 typedef struct
@@ -90,6 +94,16 @@ static void adjustScheduleForMissedOn(unsigned long now)
 
   if (now > config.next_on_time)
   {
+    unsigned long timeDiff = now - config.next_on_time;
+    if (timeDiff <= SCHEDULE_TOLERANCE_SECONDS)
+    {
+      // Small miss: Log and skip adjustment to avoid over-correction
+      Serial.print("Small schedule miss (");
+      Serial.print(timeDiff);
+      Serial.println("s); skipping reschedule.");
+      return;
+    }
+
     Serial.print("Now is ahead of next_on_time (missed): ");
     Serial.println(config.next_on_time);
     if (!config.is_on)
@@ -154,16 +168,23 @@ bool connectToMqtt()
   if (client.connected())
     return true;
 
+  // Check WiFi status first
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("MQTT connect failed: WiFi not connected");
+    blinkState = STATE_MQTT_FAILED;
+    return false;
+  }
+
   Serial.println("Connecting to MQTT...");
   // indicate MQTT connection attempt
   blinkState = STATE_MQTT_CONNECTING;
 
-  if (client.connect("<topic_header>"))
+  if (client.connect("cardoz"))
   {
     Serial.println("connected!");
     blinkState = STATE_MQTT_CONNECTED;
-    client.subscribe("/<topic_header>/config");
-    client.subscribe("/<topic_header>/control");
+    client.subscribe(TOPIC_CONFIG);
+    client.subscribe(TOPIC_CONTROL);
     return true;
   }
   else
@@ -181,7 +202,7 @@ void messageReceived(String &topic, String &payload)
   const char *cstr = payload.c_str();
 
   // handle config messages
-  if (topic.equals("/<topic_header>/config"))
+  if (topic.equals(TOPIC_CONFIG))
   {
     // parse simple JSON-like payload for interval and duration (seconds)
     // example payload: {"interval":3600,"duration":30}
@@ -232,40 +253,33 @@ void messageReceived(String &topic, String &payload)
     /* Publish back to acknowledge reception of config */
     if (client.connected())
     {
-      client.publish("/<topic_header>/ack", "{\"interval\":" + String(config.interval) + ",\"duration\":" + String(config.duration) + ",\"Turn_ON_AT\":" + String(config.next_on_time) + "}");
+      client.publish(TOPIC_ACK, "{\"interval\":" + String(config.interval) + ",\"duration\":" + String(config.duration) + ",\"Turn_ON_AT\":" + String(config.next_on_time) + "}");
     }
 
     return;
   }
 
   // handle direct control messages
-  if (topic.equals("/<topic_header>/control"))
+  if (topic.equals(TOPIC_CONTROL))
   {
     // payload can be just ON/OFF or JSON like {"output":"ON"}
     char valbuf[16] = {0};
-    const char *p = strstr(cstr, "output");
-    if (!p)
+
+    cJSON *root = cJSON_Parse(cstr);
+    if (root)
     {
-      // use payload directly
-      strncpy(valbuf, cstr, sizeof(valbuf) - 1);
-    }
-    else
-    {
-      p = strchr(p, ':');
-      if (p)
+      cJSON *output = cJSON_GetObjectItemCaseSensitive(root, "output");
+      if (cJSON_IsString(output) && (output->valuestring != NULL))
       {
-        p++; // move past ':'
-        while (*p && isspace((unsigned char)*p))
-          p++;
-        if (*p == '"' || *p == '\'')
-          p++;
-        int i = 0;
-        while (*p && *p != '"' && *p != '\'' && *p != ',' && !isspace((unsigned char)*p) && i < (int)sizeof(valbuf) - 1)
-        {
-          valbuf[i++] = *p++;
-        }
-        valbuf[i] = '\0';
+        strncpy(valbuf, output->valuestring, sizeof(valbuf) - 1);
       }
+      cJSON_Delete(root);
+    }
+
+    if (valbuf[0] == '\0')
+    {
+      // fallback: support plain text ON/OFF message bodies
+      strncpy(valbuf, cstr, sizeof(valbuf) - 1);
     }
 
     // normalize to uppercase
@@ -280,7 +294,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT ON");
       if (client.connected())
       {
-        client.publish("/<topic_header>/ack", "ON");
+        client.publish(TOPIC_ACK, "ON");
       }
       // persist immediate control change
       saveSchedule();
@@ -293,7 +307,7 @@ void messageReceived(String &topic, String &payload)
       Serial.println("Control: OUTPUT OFF");
       if (client.connected())
       {
-        client.publish("/<topic_header>/ack", "OFF");
+        client.publish(TOPIC_ACK, "OFF");
       }
       // persist immediate control change
       saveSchedule();
@@ -464,6 +478,31 @@ void loop()
 {
   client.loop();
 
+  // Check WiFi status
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, attempting reconnect...");
+    blinkState = STATE_WIFI_CONNECTING;
+    WiFi.reconnect();
+    // Wait for reconnect, up to 10 seconds
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("WiFi reconnected!");
+      blinkState = STATE_WIFI_CONNECTED;
+      // Attempt MQTT reconnect immediately if it was disconnected
+      if (!client.connected()) {
+        connectToMqtt();
+      }
+    } else {
+      Serial.println("WiFi reconnect failed");
+      blinkState = STATE_FAILED;
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+  }
+
   if (!client.connected())
   {
     // try reconnecting with a short backoff to avoid busy-looping
@@ -479,7 +518,7 @@ void loop()
   if (nowMillis - lastMillis > 30000)
   {
     lastMillis = nowMillis;
-    client.publish("/<topic_header>/heartbeat", "alive");
+    client.publish(TOPIC_HEARTBEAT, "alive");
   }
 
   // scheduling: use current time (epoch or uptime) to control relay based on config
@@ -512,7 +551,7 @@ void loop()
     Serial.println(config.next_on_time);
     if (client.connected())
     {
-      client.publish("/<topic_header>/ack", "ON");
+      client.publish("/cardoz/ack", "ON");
     }
     // persist schedule changes
     saveSchedule();
@@ -528,7 +567,7 @@ void loop()
     Serial.println(now);
     if (client.connected())
     {
-      client.publish("/<topic_header>/ack", "OFF");
+      client.publish("/cardoz/ack", "OFF");
     }
     // persist schedule changes
     saveSchedule();
