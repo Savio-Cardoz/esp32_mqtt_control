@@ -164,6 +164,7 @@ The `platformio.ini` automatically installs:
 
 ![Setup](images/setup.jpg)
 
+Set your topics in `./include/mqtt_topics.h`
 
 Build the project:
 ```bash
