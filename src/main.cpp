@@ -8,7 +8,7 @@
 #include "ESP32OTAPull.h"
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "0.0.0"
+#define FIRMWARE_VERSION "0.0.1"
 #endif
 
 #define MQTT_HOST "broker.emqx.io"
@@ -546,7 +546,41 @@ void loop()
   if (nowMillis - lastMillis > 30000)
   {
     lastMillis = nowMillis;
-    client.publish(TOPIC_HEARTBEAT, "alive");
+    
+    // Create JSON heartbeat payload
+    cJSON *heartbeat = cJSON_CreateObject();
+    cJSON_AddStringToObject(heartbeat, "firmware_version", currentFirmwareVersion);
+    cJSON_AddNumberToObject(heartbeat, "interval_s", config.interval);
+    cJSON_AddNumberToObject(heartbeat, "duration_s", config.duration);
+    
+    // Convert next_on_time to human readable format (IST)
+    char next_on_str[25]; // Buffer for "HH:MM DD-MM" format
+    time_t next_on_time = (time_t)config.next_on_time + 19800; // Add IST offset (UTC+5:30)
+    struct tm *timeinfo = localtime(&next_on_time);
+    if (timeinfo != NULL) {
+      strftime(next_on_str, sizeof(next_on_str), "%H:%M %d-%m", timeinfo);
+      cJSON_AddStringToObject(heartbeat, "next_on_time", next_on_str);
+    } else {
+      // Fallback to epoch time if conversion fails
+      cJSON_AddNumberToObject(heartbeat, "next_on_time", config.next_on_time);
+    }
+    
+    // Convert current_time to human readable format (IST)
+    char current_time_str[25]; // Buffer for "HH:MM DD-MM" format
+    time_t current_time = (time_t)getCurrentTime() + 19800; // Add IST offset (UTC+5:30)
+    struct tm *current_timeinfo = localtime(&current_time);
+    if (current_timeinfo != NULL) {
+      strftime(current_time_str, sizeof(current_time_str), "%H:%M %d-%m", current_timeinfo);
+      cJSON_AddStringToObject(heartbeat, "current_time", current_time_str);
+    } else {
+      // Fallback to epoch time if conversion fails
+      cJSON_AddNumberToObject(heartbeat, "current_time", getCurrentTime());
+    }
+    
+    char *heartbeat_str = cJSON_PrintUnformatted(heartbeat);
+    client.publish(TOPIC_HEARTBEAT, heartbeat_str);
+    free(heartbeat_str);
+    cJSON_Delete(heartbeat);
   }
 
   // scheduling: use current time (epoch or uptime) to control relay based on config
