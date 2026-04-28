@@ -5,8 +5,19 @@
 #include <cJSON.h>
 #include "mqtt_topics.h"
 
+#include "ESP32OTAPull.h"
+
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "0.0.0"
+#endif
+
 #define MQTT_HOST "broker.emqx.io"
 #define MQTT_PORT 1883
+
+// OTA firmware update check configuration
+#define DEFAULT_OTA_CHECK_INTERVAL 60 // check for updates every 1 minute (60 seconds)
+
+#define JSON_URL   "http://80.225.207.106/esp32_images/updates.json" //this is where you'll post your JSON filter file
 
 // LED blink states used by the blink task (separate WIFI and MQTT states)
 enum BlinkState
@@ -27,6 +38,11 @@ typedef struct config
 
 // shared state variable accessible from both setup() and the blink task
 volatile BlinkState blinkState = STATE_WIFI_CONNECTING;
+
+// OTA firmware version and check interval
+const char* currentFirmwareVersion = FIRMWARE_VERSION;
+unsigned long otaCheckInterval = DEFAULT_OTA_CHECK_INTERVAL; // seconds between OTA checks
+unsigned long lastOtaCheckTime = 0; // timestamp of last OTA check
 
 MQTTClient client;
 unsigned long lastMillis = 0;
@@ -61,6 +77,9 @@ system_config_t config = DEFAULT_CONFIG;
 
 // NVS (Preferences) for persisting schedule
 Preferences prefs;
+
+void callback(int offset, int totallength);
+const char *errtext(int code);
 
 static void saveSchedule()
 {
@@ -159,8 +178,9 @@ static unsigned long getCurrentTime()
   return millis() / 1000;
 }
 
-// forward declaration of blink task
+// forward declaration of blink task and OTA task
 void blinkTask(void *param);
+void otaUpdateTask(void *param);
 
 // attempt a single MQTT connection; returns true on success
 bool connectToMqtt()
@@ -179,7 +199,7 @@ bool connectToMqtt()
   // indicate MQTT connection attempt
   blinkState = STATE_MQTT_CONNECTING;
 
-  if (client.connect("cardoz"))
+  if (client.connect("shortstop"))
   {
     Serial.println("connected!");
     blinkState = STATE_MQTT_CONNECTED;
@@ -333,6 +353,7 @@ void setup()
 
   // put your setup code here, to run once:
   Serial.begin(115200);
+  Serial.printf("Firmware version: %s\n", FIRMWARE_VERSION);
 
   // onboard LED initialization (DoIT ESP32 DevKit usually uses GPIO2)
   pinMode(LED_BUILTIN, OUTPUT);
@@ -343,6 +364,9 @@ void setup()
 
   // start the blink thread before attempting WiFi connection
   xTaskCreate(blinkTask, "blink", 1024, nullptr, 1, nullptr);
+  
+  // start the OTA update check thread
+  xTaskCreate(otaUpdateTask, "otaUpdate", 4096, nullptr, 1, nullptr);
 
   // --- configuration loading happens before WiFi so schedule can run when offline ---
   prefs.begin("home_irrigator", false);
@@ -472,6 +496,10 @@ void setup()
   {
     delay(1000);
   }
+  
+  // Initialize last OTA check time
+  lastOtaCheckTime = getCurrentTime();
+  
 }
 
 void loop()
@@ -626,4 +654,87 @@ void blinkTask(void *param)
       break;
     }
   }
+}
+
+const char *errtext(int code)
+{
+	switch(code)
+	{
+		case ESP32OTAPull::UPDATE_AVAILABLE:
+			return "An update is available but wasn't installed";
+		case ESP32OTAPull::NO_UPDATE_PROFILE_FOUND:
+			return "No profile matches";
+		case ESP32OTAPull::NO_UPDATE_AVAILABLE:
+			return "Profile matched, but update not applicable";
+		case ESP32OTAPull::UPDATE_OK:
+			return "An update was done, but no reboot";
+		case ESP32OTAPull::HTTP_FAILED:
+			return "HTTP GET failure";
+		case ESP32OTAPull::WRITE_ERROR:
+			return "Write error";
+		case ESP32OTAPull::JSON_PROBLEM:
+			return "Invalid JSON";
+		case ESP32OTAPull::OTA_UPDATE_FAIL:
+			return "Update fail (no OTA partition?)";
+		default:
+			if (code > 0)
+				return "Unexpected HTTP response code";
+			break;
+	}
+	return "Unknown error";
+}
+
+// OTA update check task implementation
+void otaUpdateTask(void *param)
+{
+  (void)param;
+  
+  while (true)
+  {
+    // Check if it's time to run the OTA update check
+    unsigned long now = getCurrentTime();
+    
+    // Only check if enough time has elapsed and WiFi is connected
+    if ((now - lastOtaCheckTime) >= otaCheckInterval && WiFi.status() == WL_CONNECTED)
+    {
+      lastOtaCheckTime = now;
+      
+      Serial.println("\n=== OTA Update Check Task ===\r");
+      Serial.printf("Checking %s for firmware updates...\r\n", JSON_URL);
+      Serial.printf("Current firmware version: %s\r\n", currentFirmwareVersion);
+      Serial.printf("Check interval: %lu seconds\r\n", otaCheckInterval);
+      
+      // Perform the OTA check
+      ESP32OTAPull ota;
+      int ret = ota.CheckForOTAUpdate(JSON_URL, currentFirmwareVersion);
+      Serial.printf("CheckForOTAUpdate returned %d (%s)\r\n", ret, errtext(ret));
+      Serial.println("===========================\r\n");
+      
+      // Publish status to MQTT if connected
+      if (client.connected())
+      {
+        String status = "{\"firmware_version\":\"";
+        status += currentFirmwareVersion;
+        status += "\",\"ota_check_result\":";
+        status += String(ret);
+        status += ",\"check_timestamp\":";
+        status += String(now);
+        status += "}";
+        client.publish("/cardoz/status/firmware", status);
+      }
+    }
+    
+    // Check every minute if it's time to perform OTA check
+    vTaskDelay(60000 / portTICK_PERIOD_MS);
+  }
+}
+
+void callback(int offset, int totallength)
+{
+	Serial.printf("Updating %d of %d (%02d%%)...\r\n", offset, totallength, 100 * offset / totallength);
+#if defined(LED_BUILTIN) // flicker LED on update
+	static int status = LOW;
+	status = status == LOW && offset < totallength ? HIGH : LOW;
+	digitalWrite(LED_BUILTIN, status);
+#endif
 }

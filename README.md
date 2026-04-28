@@ -55,6 +55,134 @@ home_irrigator/
 | Timezone | UTC (0,0) | Configurable via `configTime()` |
 | Relay Pin | GPIO 5 | Configurable via `#define RELAY_PIN` |
 
+## Firmware Update Server Configuration
+
+The project includes a firmware update server that serves ESP32 firmware images and handles over-the-air (OTA) updates. The server is built with Flask and runs on port 8800.
+
+### Server Setup
+
+1. **Install Dependencies**:
+   ```bash
+   cd Server
+   pip install -r requirements.txt
+   ```
+
+2. **Directory Structure**:
+   ```
+   Server/
+   ├── esp32_images/          # Directory for firmware binaries
+   │   └── updates.json       # JSON configuration file for OTA updates
+   ├── server.py              # Flask application
+   ├── requirements.txt       # Python dependencies
+   └── nginx_sites_enabled    # Nginx proxy configuration
+   ```
+
+3. **Run the Server**:
+   ```bash
+   python server.py
+   ```
+   The server will start on `http://localhost:8800`
+
+### Nginx Proxy Configuration
+
+For production deployment, use the provided Nginx configuration:
+
+```nginx
+location /esp32_images/ {
+    proxy_pass http://127.0.0.1:8800/esp32_images/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+                        
+    # Allow large file uploads/downloads
+    client_max_body_size 100M;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+}
+```
+
+### OTA Update JSON Configuration
+
+Create an `updates.json` file in the `esp32_images/` directory with the following structure:
+
+```json
+{
+  "Configurations": [
+    {
+      "Board": "esp32doit-devkit-v1",
+      "Device": "MAC_ADDRESS",
+      "Version": "1.0.2",
+      "Config": "",
+      "URL": "http://your-server.com/esp32_images/firmware_1.0.2.bin"
+    }
+  ]
+}
+```
+
+**JSON Fields**:
+- `Board`: Target board type (matches `ARDUINO_BOARD`)
+- `Device`: Specific device identifier (optional, defaults to MAC address)
+- `Version`: Firmware version string
+- `Config`: Configuration identifier (optional)
+- `URL`: Full URL to the firmware binary file
+
+## Application Configuration for Firmware Updates
+
+The ESP32 application includes built-in OTA update functionality that periodically checks for firmware updates.
+
+### OTA Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Firmware Version | 1.0.1 | Current firmware version (set in `platformio.ini`) |
+| OTA Check Interval | 60 seconds | How often to check for updates |
+| JSON URL | http://80.225.207.106/esp32_images/updates.json | URL of the update configuration JSON |
+| Allow Downgrades | false | Whether to allow installing older firmware versions |
+
+### Firmware Version Management
+
+Update the firmware version in `platformio.ini`:
+
+```ini
+build_flags =
+  -D FIRMWARE_VERSION=\"1.0.2\"
+```
+
+### OTA Update Process
+
+1. **Automatic Checks**: The device checks for updates every 60 seconds when WiFi is connected
+2. **Version Comparison**: Compares current version with available updates
+3. **Download & Install**: Downloads and installs newer firmware automatically
+4. **Reboot**: Device reboots to apply the update
+
+### OTA Status Monitoring
+
+The device publishes OTA status to MQTT topic `/cardoz/status/firmware`:
+
+```json
+{
+  "firmware_version": "1.0.1",
+  "ota_check_result": 0,
+  "check_timestamp": 1708532400
+}
+```
+
+**OTA Result Codes**:
+- `-3`: Update available
+- `-2`: No update profile found
+- `-1`: No update available
+- `0`: Update successful
+- `1`: HTTP failure
+- `2`: Write error
+- `3`: JSON problem
+- `4`: OTA update failure
+
+### Manual OTA Trigger
+
+To manually trigger an OTA check, restart the device or modify the `otaCheckInterval` in the code.
+
 ---
 
 ## MQTT Topics
