@@ -21,7 +21,7 @@
 // OTA firmware update check configuration
 #define DEFAULT_OTA_CHECK_INTERVAL 60 // check for updates every 1 minute (60 seconds)
 
-#define JSON_URL   "http://80.225.207.106/esp32_images/updates.json" //this is where you'll post your JSON filter file
+#define JSON_URL SERVER_URL //this is where you'll post your JSON filter file
 
 // LED blink states used by the blink task (separate WIFI and MQTT states)
 enum BlinkState

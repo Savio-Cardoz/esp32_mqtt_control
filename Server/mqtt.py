@@ -8,13 +8,13 @@ import pytz
 # --- Configuration ---
 MQTT_BROKER = "broker.emqx.io"  # e.g., "broker.emqx.io" or your OCI IP
 MQTT_PORT = 1883
-MQTT_TOPIC = "/cardoz/ack"
+MQTT_TOPIC = "/your_topic_header/ack"
 MQTT_USER = None          # Leave None if not required
 MQTT_PASS = None          # Leave None if not required
 
 # WABridge Local Settings (assuming it's on the same OCI instance)
 WABRIDGE_ENDPOINT = "http://localhost:8080/send" 
-TARGET_PHONE = "919969957630" # Your WhatsApp number with country code
+TARGET_PHONE = "<YOUR_WHATSAPP_NUMBER>" # Your WhatsApp number with country code
 
 ist = pytz.timezone('Asia/Kolkata')
 
