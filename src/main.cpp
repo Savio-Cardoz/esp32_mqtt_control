@@ -8,6 +8,8 @@
 #include "ESP32OTAPull.h"
 
 #include <WaterFlowSensor.h>
+#include <Wire.h>
+#include "DFRobot_DHT20.h"
 
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.0.1"
@@ -84,6 +86,7 @@ system_config_t config = DEFAULT_CONFIG;
 Preferences prefs;
 
 WaterFlowSensor flowSensor(15); // example flow sensor on GPIO4; adjust as needed
+DFRobot_DHT20 dht20;
 
 void callback(int offset, int totallength);
 const char *errtext(int code);
@@ -363,6 +366,7 @@ void setup()
   Serial.printf("Firmware version: %s\n", FIRMWARE_VERSION);
 
   flowSensor.begin(); // initialize flow sensor
+  dht20.begin();
 
   // onboard LED initialization (DoIT ESP32 DevKit usually uses GPIO2)
   pinMode(LED_BUILTIN, OUTPUT);
@@ -572,7 +576,10 @@ void loop()
     cJSON_AddStringToObject(heartbeat, "firmware_version", currentFirmwareVersion);
     cJSON_AddNumberToObject(heartbeat, "interval_s", config.interval);
     cJSON_AddNumberToObject(heartbeat, "duration_s", config.duration);
-    
+    // Round out the temperature and humidity values to 1 decimal place for cleaner output
+    cJSON_AddNumberToObject(heartbeat, "temperature_c", round(dht20.getTemperature() * 10) / 10.0);
+    cJSON_AddNumberToObject(heartbeat, "humidity_pct", round(dht20.getHumidity() * 1000) / 10.0);
+  
     // Convert next_on_time to human readable format (IST)
     char next_on_str[25]; // Buffer for "HH:MM DD-MM" format
     time_t next_on_time = (time_t)config.next_on_time + 19800; // Add IST offset (UTC+5:30)
@@ -634,11 +641,15 @@ void loop()
     Serial.println(config.next_on_time);
     if (client.connected())
     {
-      // create a JSON payload that includes flowrate, volume at time of turn-off
+      // create a JSON payload that includes flowrate, volume, temperature, and humidity at time of turn-off
       cJSON *ack = cJSON_CreateObject();
       cJSON_AddStringToObject(ack, "status", "ON");
       cJSON_AddNumberToObject(ack, "flow_rate_lpm", flowSensor.getFlowRate());
       cJSON_AddNumberToObject(ack, "total_volume_l", flowSensor.getTotalVolume());
+      // Round out the temperature and humidity values to 1 decimal place for cleaner output
+      cJSON_AddNumberToObject(ack, "temperature_c", round(dht20.getTemperature() * 10) / 10.0);
+      cJSON_AddNumberToObject(ack, "humidity_pct", round(dht20.getHumidity() * 1000) / 10.0);
+
       char *ack_str = cJSON_PrintUnformatted(ack);
 
       client.publish(TOPIC_ACK, ack_str);
@@ -659,11 +670,14 @@ void loop()
     Serial.println(now);
     if (client.connected())
     {
-      // create a JSON payload that includes flowrate, volume at time of turn-off
+      // create a JSON payload that includes flowrate, volume, temperature, and humidity at time of turn-off
       cJSON *ack = cJSON_CreateObject();
       cJSON_AddStringToObject(ack, "status", "OFF");
       cJSON_AddNumberToObject(ack, "flow_rate_lpm", flowSensor.getFlowRate());
       cJSON_AddNumberToObject(ack, "total_volume_l", flowSensor.getTotalVolume());
+      // Round out the temperature and humidity values to 1 decimal place for cleaner output
+      cJSON_AddNumberToObject(ack, "temperature_c", round(dht20.getTemperature() * 10) / 10.0);
+      cJSON_AddNumberToObject(ack, "humidity_pct", round(dht20.getHumidity() * 1000) / 10.0);
       char *ack_str = cJSON_PrintUnformatted(ack);
 
       client.publish(TOPIC_ACK, ack_str);
@@ -683,6 +697,9 @@ void loop()
       Serial.printf("Flow: %.2f L/min | Total: %.2f L\r\n", 
                     flowSensor.getFlowRate(), 
                     flowSensor.getTotalVolume());
+      float temperature = dht20.getTemperature();
+      float humidity = dht20.getHumidity();
+      Serial.printf("Temperature: %.1f °C | Humidity: %.1f %%\r\n", temperature, humidity * 100);
       lastPrint = millis();
   }
 
