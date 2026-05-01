@@ -7,6 +7,8 @@
 
 #include "ESP32OTAPull.h"
 
+#include <WaterFlowSensor.h>
+
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "0.0.1"
 #endif
@@ -48,6 +50,9 @@ MQTTClient client;
 unsigned long lastMillis = 0;
 WiFiClient wifiClient;
 
+static const unsigned long WIFI_RECOVERY_TIMEOUT_MS = 10UL * 60UL * 1000UL;
+unsigned long wifiDisconnectStart = 0;
+
 // Relay pin (change if you use a different GPIO). Avoid using LED pin.
 #define RELAY_PIN 5
 
@@ -77,6 +82,8 @@ system_config_t config = DEFAULT_CONFIG;
 
 // NVS (Preferences) for persisting schedule
 Preferences prefs;
+
+WaterFlowSensor flowSensor(15); // example flow sensor on GPIO4; adjust as needed
 
 void callback(int offset, int totallength);
 const char *errtext(int code);
@@ -355,6 +362,8 @@ void setup()
   Serial.begin(115200);
   Serial.printf("Firmware version: %s\n", FIRMWARE_VERSION);
 
+  flowSensor.begin(); // initialize flow sensor
+
   // onboard LED initialization (DoIT ESP32 DevKit usually uses GPIO2)
   pinMode(LED_BUILTIN, OUTPUT);
 
@@ -508,6 +517,9 @@ void loop()
 
   // Check WiFi status
   if (WiFi.status() != WL_CONNECTED) {
+    if (wifiDisconnectStart == 0) {
+      wifiDisconnectStart = millis();
+    }
     Serial.println("WiFi disconnected, attempting reconnect...");
     blinkState = STATE_WIFI_CONNECTING;
     WiFi.reconnect();
@@ -520,6 +532,7 @@ void loop()
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("WiFi reconnected!");
       blinkState = STATE_WIFI_CONNECTED;
+      wifiDisconnectStart = 0;
       // Attempt MQTT reconnect immediately if it was disconnected
       if (!client.connected()) {
         connectToMqtt();
@@ -527,8 +540,15 @@ void loop()
     } else {
       Serial.println("WiFi reconnect failed");
       blinkState = STATE_FAILED;
+      if (wifiDisconnectStart != 0 && millis() - wifiDisconnectStart >= WIFI_RECOVERY_TIMEOUT_MS) {
+        Serial.println("WiFi not restored within 10 minutes, restarting system...");
+        delay(100);
+        ESP.restart();
+      }
       vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
+  } else {
+    wifiDisconnectStart = 0;
   }
 
   if (!client.connected())
@@ -600,6 +620,7 @@ void loop()
   // turn ON when it's time
   if (!config.is_on && config.next_on_time > 0 && now >= config.next_on_time)
   {
+    flowSensor.resetVolume(); // reset volume at the start of each ON cycle
     digitalWrite(RELAY_PIN, HIGH);
     config.is_on = true;
     config.off_time = now + config.duration;
@@ -613,7 +634,16 @@ void loop()
     Serial.println(config.next_on_time);
     if (client.connected())
     {
-      client.publish("/cardoz/ack", "ON");
+      // create a JSON payload that includes flowrate, volume at time of turn-off
+      cJSON *ack = cJSON_CreateObject();
+      cJSON_AddStringToObject(ack, "status", "ON");
+      cJSON_AddNumberToObject(ack, "flow_rate_lpm", flowSensor.getFlowRate());
+      cJSON_AddNumberToObject(ack, "total_volume_l", flowSensor.getTotalVolume());
+      char *ack_str = cJSON_PrintUnformatted(ack);
+
+      client.publish(TOPIC_ACK, ack_str);
+      free(ack_str);
+      cJSON_Delete(ack);
     }
     // persist schedule changes
     saveSchedule();
@@ -629,10 +659,31 @@ void loop()
     Serial.println(now);
     if (client.connected())
     {
-      client.publish("/cardoz/ack", "OFF");
+      // create a JSON payload that includes flowrate, volume at time of turn-off
+      cJSON *ack = cJSON_CreateObject();
+      cJSON_AddStringToObject(ack, "status", "OFF");
+      cJSON_AddNumberToObject(ack, "flow_rate_lpm", flowSensor.getFlowRate());
+      cJSON_AddNumberToObject(ack, "total_volume_l", flowSensor.getTotalVolume());
+      char *ack_str = cJSON_PrintUnformatted(ack);
+
+      client.publish(TOPIC_ACK, ack_str);
+      free(ack_str);
+      cJSON_Delete(ack);
     }
+
+    flowSensor.resetVolume(); // reset total volume after each OFF cycle
+
     // persist schedule changes
     saveSchedule();
+  }
+
+
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+      Serial.printf("Flow: %.2f L/min | Total: %.2f L\r\n", 
+                    flowSensor.getFlowRate(), 
+                    flowSensor.getTotalVolume());
+      lastPrint = millis();
   }
 
   // main work can go here; blink task runs independently
